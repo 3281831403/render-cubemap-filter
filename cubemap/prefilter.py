@@ -1,4 +1,4 @@
-"""立方体贴图预滤波（待实现）。
+"""立方体贴图预滤波。
 
 约定
 ----
@@ -17,8 +17,6 @@
 * 浮点比较容差为 ``1e-6``；采样序列完全确定，不得使用随机模块，保证
   离线、可复现。
 * 非法输入统一抛出 :class:`CubemapError`。
-
-本模块当前是失败基线：8 个公开函数都只抛出 ``NotImplementedError``。
 """
 
 from __future__ import annotations
@@ -33,6 +31,81 @@ GOLDEN_RATIO = 0.6180339887498949
 
 class CubemapError(ValueError):
     """立方体贴图输入、配置或批量状态非法。"""
+
+
+def _is_number(value: object) -> bool:
+    """判断是否是实数（排除 bool）。"""
+
+    return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def _is_finite_number(value: object) -> bool:
+    return _is_number(value) and math.isfinite(float(value))
+
+
+def _check_roughness(roughness: object) -> float:
+    if not _is_finite_number(roughness):
+        raise CubemapError("roughness 必须是有限实数")
+    value = float(roughness)
+    if value < 0.0 or value > 1.0:
+        raise CubemapError("roughness 必须位于 [0.0, 1.0]")
+    return value
+
+
+def _check_samples(samples: object) -> int:
+    if not isinstance(samples, int) or isinstance(samples, bool):
+        raise CubemapError("samples 必须是正整数")
+    if samples <= 0:
+        raise CubemapError("samples 必须大于 0")
+    return samples
+
+
+def _check_positive_int(value: object, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool) or value <= 0:
+        raise CubemapError(f"{name} 必须是正整数")
+    return value
+
+
+def _normalize3(
+    vector: object, name: str = "方向"
+) -> tuple[float, float, float]:
+    """把三分量向量归一化，非法时抛 :class:`CubemapError`。"""
+
+    if not isinstance(vector, (tuple, list)) or len(vector) != 3:
+        raise CubemapError(f"{name} 必须是三个分量的向量")
+    if not all(_is_finite_number(component) for component in vector):
+        raise CubemapError(f"{name} 的分量必须是有限实数")
+    x, y, z = (float(component) for component in vector)
+
+    # 先按最大分量缩放，避免平方溢出/下溢。
+    scale = max(abs(x), abs(y), abs(z))
+    if scale == 0.0:
+        raise CubemapError(f"{name} 不能是零向量")
+    x, y, z = x / scale, y / scale, z / scale
+    length = math.sqrt(x * x + y * y + z * z)
+    if length == 0.0 or not math.isfinite(length):
+        raise CubemapError(f"{name} 不能是零向量")
+    return (x / length, y / length, z / length)
+
+
+def _direction_from_face_uv(face: int, u: float, v: float) -> tuple[float, float, float]:
+    """按面内坐标重建（未归一化的）方向。"""
+
+    su = 2.0 * u - 1.0
+    sv = 2.0 * v - 1.0
+    if face == 0:  # +X
+        return (1.0, -sv, -su)
+    if face == 1:  # -X
+        return (-1.0, -sv, su)
+    if face == 2:  # +Y
+        return (su, 1.0, sv)
+    if face == 3:  # -Y
+        return (su, -1.0, -sv)
+    if face == 4:  # +Z
+        return (su, -sv, 1.0)
+    if face == 5:  # -Z
+        return (-su, -sv, -1.0)
+    raise CubemapError(f"未知的面索引 {face!r}")
 
 
 def dir_to_face_uv(direction: tuple[float, float, float]) -> tuple[int, float, float]:
@@ -58,7 +131,42 @@ def dir_to_face_uv(direction: tuple[float, float, float]) -> tuple[int, float, f
     CubemapError: 方向不是三个有限实数，或为零向量。
     """
 
-    raise NotImplementedError("dir_to_face_uv 尚未实现")
+    x, y, z = _normalize3(direction)
+    ax, ay, az = abs(x), abs(y), abs(z)
+
+    # 主轴并列时按 X → Y → Z 优先。
+    if ax >= ay and ax >= az:
+        if x > 0.0:
+            face = 0
+            u = 0.5 * (1.0 - z / x)
+            v = 0.5 * (1.0 - y / x)
+        else:
+            face = 1
+            u = 0.5 * (1.0 - z / x)
+            v = 0.5 * (1.0 + y / x)
+    elif ay >= az:
+        if y > 0.0:
+            face = 2
+            u = 0.5 * (1.0 + x / y)
+            v = 0.5 * (1.0 + z / y)
+        else:
+            face = 3
+            u = 0.5 * (1.0 - x / y)
+            v = 0.5 * (1.0 + z / y)
+    else:
+        if z > 0.0:
+            face = 4
+            u = 0.5 * (1.0 + x / z)
+            v = 0.5 * (1.0 - y / z)
+        else:
+            face = 5
+            u = 0.5 * (1.0 + x / z)
+            v = 0.5 * (1.0 + y / z)
+
+    # 数值噪声可能让结果略微越过边界。
+    u = min(max(u, 0.0), 1.0)
+    v = min(max(v, 0.0), 1.0)
+    return face, u, v
 
 
 def texel_angle(face_size: int) -> float:
@@ -85,7 +193,9 @@ def texel_angle(face_size: int) -> float:
     CubemapError: ``face_size`` 不是正整数。
     """
 
-    raise NotImplementedError("texel_angle 尚未实现")
+    size = _check_positive_int(face_size, "face_size")
+    # 4π 均分给 6 个面，每个面再均分给 size² 个纹素。
+    return 4.0 * math.pi / (FACE_COUNT * size * size)
 
 
 def mip_for_roughness(roughness: float, max_mip: int) -> int:
@@ -113,7 +223,17 @@ def mip_for_roughness(roughness: float, max_mip: int) -> int:
     CubemapError: 粗糙度越界或 ``max_mip`` 非法。
     """
 
-    raise NotImplementedError("mip_for_roughness 尚未实现")
+    value = _check_roughness(roughness)
+    if not isinstance(max_mip, int) or isinstance(max_mip, bool) or max_mip < 0:
+        raise CubemapError("max_mip 必须是非负整数")
+
+    level = math.ceil(value * max_mip)
+    # 浮点误差可能让 ceil 越界，夹紧到合法区间。
+    if level < 0:
+        level = 0
+    if level > max_mip:
+        level = max_mip
+    return level
 
 
 def ggx_sample(
@@ -151,7 +271,112 @@ def ggx_sample(
     CubemapError: 法线、粗糙度或 ``xi`` 非法。
     """
 
-    raise NotImplementedError("ggx_sample 尚未实现")
+    nx, ny, nz = _normalize3(normal, "normal")
+    value = _check_roughness(roughness)
+
+    if not isinstance(xi, (tuple, list)) or len(xi) != 2:
+        raise CubemapError("xi 必须是两个分量的样本")
+    if not all(_is_finite_number(component) for component in xi):
+        raise CubemapError("xi 的分量必须是有限实数")
+    u1, u2 = float(xi[0]), float(xi[1])
+    if not (0.0 <= u1 < 1.0 and 0.0 <= u2 < 1.0):
+        raise CubemapError("xi 的分量必须位于 [0.0, 1.0)")
+
+    if value == 0.0:
+        # 镜面：半程向量就是法线本身。
+        return (nx, ny, nz)
+
+    a = value * value
+    denominator = 1.0 + (a * a - 1.0) * u1
+    cos_theta = math.sqrt(max((1.0 - u1) / denominator, 0.0))
+    cos_theta = min(max(cos_theta, -1.0), 1.0)
+    sin_theta = math.sqrt(max(1.0 - cos_theta * cos_theta, 0.0))
+    phi = 2.0 * math.pi * u2
+
+    # 以 normal 为 Z 轴构造正交基；选择与 normal 不平行的辅助轴。
+    if abs(nz) < 0.999:
+        helper = (0.0, 0.0, 1.0)
+    else:
+        helper = (1.0, 0.0, 0.0)
+    tangent = _cross(helper, (nx, ny, nz))
+    tangent = _normalize_vec(tangent)
+    bitangent = _cross((nx, ny, nz), tangent)
+
+    tx = sin_theta * math.cos(phi)
+    ty = sin_theta * math.sin(phi)
+    tz = cos_theta
+    result = (
+        tangent[0] * tx + bitangent[0] * ty + nx * tz,
+        tangent[1] * tx + bitangent[1] * ty + ny * tz,
+        tangent[2] * tx + bitangent[2] * ty + nz * tz,
+    )
+    return _normalize_vec(result)
+
+
+def _cross(
+    left: tuple[float, float, float], right: tuple[float, float, float]
+) -> tuple[float, float, float]:
+    return (
+        left[1] * right[2] - left[2] * right[1],
+        left[2] * right[0] - left[0] * right[2],
+        left[0] * right[1] - left[1] * right[0],
+    )
+
+
+def _normalize_vec(vector: tuple[float, float, float]) -> tuple[float, float, float]:
+    length = math.sqrt(
+        vector[0] * vector[0] + vector[1] * vector[1] + vector[2] * vector[2]
+    )
+    if length == 0.0:
+        return vector
+    return (vector[0] / length, vector[1] / length, vector[2] / length)
+
+
+def _frac(value: float) -> float:
+    return value - math.floor(value)
+
+
+def _validate_face_matrix(face: object) -> int:
+    """检查一个面是合法的非空方阵，返回边长。"""
+
+    if not isinstance(face, list):
+        raise CubemapError("面必须是二维列表")
+    if len(face) == 0:
+        raise CubemapError("面不能为空")
+    size = len(face)
+    for row_index, row in enumerate(face):
+        if not isinstance(row, (list, tuple)):
+            raise CubemapError(f"面的第 {row_index} 行不是列表")
+        if len(row) != size:
+            raise CubemapError("面必须是 n×n 方阵")
+        for col_index, value in enumerate(row):
+            if not _is_finite_number(value):
+                raise CubemapError(
+                    f"纹素 ({row_index}, {col_index}) 必须是有限实数"
+                )
+    return size
+
+
+def _sample_face_bilinear(face: list[list[float]], u: float, v: float) -> float:
+    """在面内做 clamp-to-edge 双线性采样。"""
+
+    size = len(face)
+    max_index = size - 1
+    x = u * size - 0.5
+    y = v * size - 0.5
+    x = min(max(x, 0.0), float(max_index))
+    y = min(max(y, 0.0), float(max_index))
+
+    x0 = int(math.floor(x))
+    y0 = int(math.floor(y))
+    x1 = min(x0 + 1, max_index)
+    y1 = min(y0 + 1, max_index)
+    fx = x - x0
+    fy = y - y0
+
+    top = face[y0][x0] * (1.0 - fx) + face[y0][x1] * fx
+    bottom = face[y1][x0] * (1.0 - fx) + face[y1][x1] * fx
+    return top * (1.0 - fy) + bottom * fy
 
 
 def prefilter_face(
@@ -191,7 +416,111 @@ def prefilter_face(
     CubemapError: 面结构、粗糙度或采样数非法。
     """
 
-    raise NotImplementedError("prefilter_face 尚未实现")
+    value = _check_roughness(roughness)
+    count = _check_samples(samples)
+    size = _validate_face_matrix(face)
+
+    result = [[0.0 for _ in range(size)] for _ in range(size)]
+
+    if value == 0.0:
+        # 镜面：偏移全为零，直接复制（独立分配）。
+        for row in range(size):
+            for col in range(size):
+                result[row][col] = float(face[row][col])
+        return result
+
+    normal = (0.0, 0.0, 1.0)
+    for row in range(size):
+        v = (row + 0.5) / size
+        for col in range(size):
+            u = (col + 0.5) / size
+            total = 0.0
+            for sample_index in range(count):
+                xi = (
+                    (sample_index + 0.5) / count,
+                    _frac((sample_index + 1) * GOLDEN_RATIO),
+                )
+                half_vector = ggx_sample(normal, value, xi)
+                # 切向分量乘以 0.5 作为 UV 偏移。
+                total += _sample_face_bilinear(
+                    face,
+                    u + half_vector[0] * 0.5,
+                    v + half_vector[1] * 0.5,
+                )
+            # 按样本数取平均，亮度与采样数无关。
+            result[row][col] = total / count
+    return result
+
+
+def _collect_problems(faces: object, size: object) -> list[str]:
+    """收集立方体贴图的问题；``size`` 为 ``None`` 时只检查自洽性。"""
+
+    problems: list[str] = []
+
+    expected: int | None = None
+    if size is None:
+        pass
+    elif not isinstance(size, int) or isinstance(size, bool) or size <= 0:
+        problems.append("size 必须是正整数")
+    else:
+        expected = size
+
+    if not isinstance(faces, list):
+        problems.append("faces 必须是包含 6 个面的列表")
+        return problems
+
+    if len(faces) != FACE_COUNT:
+        problems.append(
+            f"faces 必须恰好包含 {FACE_COUNT} 个面，实际为 {len(faces)} 个"
+        )
+
+    sizes: list[int] = []
+    for face_index, face in enumerate(faces):
+        name = FACE_NAMES[face_index] if face_index < FACE_COUNT else str(face_index)
+        if not isinstance(face, list):
+            problems.append(f"face {face_index} ({name}) 必须是二维列表")
+            continue
+        if len(face) == 0:
+            problems.append(f"face {face_index} ({name}) 不能为空")
+            continue
+        rows = len(face)
+        sizes.append(rows)
+        if expected is not None and rows != expected:
+            problems.append(
+                f"face {face_index} ({name}) size 为 {rows}，期望 {expected}"
+            )
+        for row_index, row in enumerate(face):
+            if not isinstance(row, (list, tuple)):
+                problems.append(
+                    f"face {face_index} ({name}) 第 {row_index} 行不是列表"
+                )
+                continue
+            if len(row) != rows:
+                problems.append(
+                    f"face {face_index} ({name}) size 不一致："
+                    f"第 {row_index} 行有 {len(row)} 列，期望 {rows}"
+                )
+            for col_index, value in enumerate(row):
+                if not _is_number(value):
+                    problems.append(
+                        f"face {face_index} ({name}) 纹素 "
+                        f"({row_index}, {col_index}) 不是有限实数"
+                    )
+                elif math.isnan(float(value)):
+                    problems.append(
+                        f"face {face_index} ({name}) 纹素 "
+                        f"({row_index}, {col_index}) 是 nan"
+                    )
+                elif not math.isfinite(float(value)):
+                    problems.append(
+                        f"face {face_index} ({name}) 纹素 "
+                        f"({row_index}, {col_index}) 不是有限数 (non-finite)"
+                    )
+
+    if len(set(sizes)) > 1:
+        problems.append(f"各面 size 不一致: {sizes}")
+
+    return problems
 
 
 def seam_fix(faces: list[list[list[float]]]) -> list[list[list[float]]]:
@@ -220,7 +549,64 @@ def seam_fix(faces: list[list[list[float]]]) -> list[list[list[float]]]:
     CubemapError: 面数不为 6、尺寸不等或纹素非法。
     """
 
-    raise NotImplementedError("seam_fix 尚未实现")
+    if not isinstance(faces, list):
+        raise CubemapError("faces 必须是包含 6 个面的列表")
+    if len(faces) != FACE_COUNT:
+        raise CubemapError(f"faces 必须恰好包含 {FACE_COUNT} 个面")
+    sizes = [_validate_face_matrix(face) for face in faces]
+    if len(set(sizes)) != 1:
+        raise CubemapError(f"各面尺寸不一致: {sizes}")
+    size = sizes[0]
+
+    result = [[row[:] for row in face] for face in faces]
+
+    # 按 1e-9 量化后的棱/角方向分组。
+    groups: dict[tuple[float, float, float], list[tuple[int, int, int]]] = {}
+    for face_index in range(FACE_COUNT):
+        for row in range(size):
+            for col in range(size):
+                on_boundary = (
+                    row == 0
+                    or row == size - 1
+                    or col == 0
+                    or col == size - 1
+                )
+                if not on_boundary:
+                    continue
+                if col == 0:
+                    u = 0.0
+                elif col == size - 1:
+                    u = 1.0
+                else:
+                    u = (col + 0.5) / size
+                if row == 0:
+                    v = 0.0
+                elif row == size - 1:
+                    v = 1.0
+                else:
+                    v = (row + 0.5) / size
+
+                direction = _normalize_vec(
+                    _direction_from_face_uv(face_index, u, v)
+                )
+                key = (
+                    round(direction[0], 9),
+                    round(direction[1], 9),
+                    round(direction[2], 9),
+                )
+                groups.setdefault(key, []).append((face_index, row, col))
+
+    for members in groups.values():
+        if len(members) < 2:
+            continue
+        average = (
+            sum(faces[face_index][row][col] for face_index, row, col in members)
+            / len(members)
+        )
+        for face_index, row, col in members:
+            result[face_index][row][col] = average
+
+    return result
 
 
 def validate_cubemap(faces: list[list[list[float]]], size: int) -> list[str]:
@@ -253,7 +639,10 @@ def validate_cubemap(faces: list[list[list[float]]], size: int) -> list[str]:
     无。
     """
 
-    raise NotImplementedError("validate_cubemap 尚未实现")
+    try:
+        return _collect_problems(faces, size)
+    except Exception as error:  # 本函数承诺不抛异常
+        return [f"faces 校验失败: {error}"]
 
 
 def prefilter_batch(cubemaps: list[dict], config: dict) -> dict:
@@ -286,4 +675,39 @@ def prefilter_batch(cubemaps: list[dict], config: dict) -> dict:
     CubemapError: 配置非法或任一贴图非法。
     """
 
-    raise NotImplementedError("prefilter_batch 尚未实现")
+    if not isinstance(config, dict):
+        raise CubemapError("config 必须是字典")
+    if "roughness" not in config:
+        raise CubemapError("config 缺少 roughness")
+    if "samples" not in config:
+        raise CubemapError("config 缺少 samples")
+    roughness = _check_roughness(config["roughness"])
+    samples = _check_samples(config["samples"])
+
+    if not isinstance(cubemaps, list):
+        raise CubemapError("cubemaps 必须是列表")
+
+    # 先整体校验：任一非法立即回滚，不产生部分结果。
+    validated: list[list[list[float]]] = []
+    for index, cubemap in enumerate(cubemaps):
+        if not isinstance(cubemap, dict):
+            raise CubemapError(f"cubemap[{index}] 必须是字典")
+        if "faces" not in cubemap:
+            raise CubemapError(f"cubemap[{index}] 缺少 faces")
+        faces = cubemap["faces"]
+        problems = _collect_problems(faces, None)
+        if problems:
+            raise CubemapError(
+                f"cubemap[{index}] 非法: " + "; ".join(problems)
+            )
+        validated.append(faces)
+
+    # 校验全部通过后再计算，输出逐项独立分配。
+    results = []
+    for faces in validated:
+        output_faces = [
+            prefilter_face(face, roughness, samples) for face in faces
+        ]
+        results.append({"faces": output_faces})
+
+    return {"cubemaps": results, "count": len(results)}
